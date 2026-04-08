@@ -3,7 +3,7 @@ import Groq from "groq-sdk";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import path from "path";
-import https from "https";
+import { Innertube } from "youtubei.js";
 
 dotenv.config();
 
@@ -34,106 +34,39 @@ function extractVideoId(url) {
   return null;
 }
 
-// Helper: fetch a URL with browser-like headers
-function fetchWithHeaders(url) {
-  return new Promise((resolve, reject) => {
-    const options = {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        Connection: "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-      },
-    };
-
-    https
-      .get(url, options, (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => resolve({ status: res.statusCode, body: data }));
-      })
-      .on("error", reject);
+// Helper: fetch transcript via InnerTube (YouTube's internal API)
+async function fetchTranscript(videoId) {
+  const yt = await Innertube.create({
+    lang: "en",
+    location: "US",
+    retrieve_player: false,
   });
-}
 
-// Helper: extract transcript from YouTube page HTML
-async function fetchTranscriptFromYouTube(videoId) {
-  // Step 1: Get the video page to extract the timedtext token
-  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const pageRes = await fetchWithHeaders(videoUrl);
+  const info = await yt.getInfo(videoId);
+  const transcriptData = await info.getTranscript();
 
-  if (pageRes.status !== 200) {
-    throw new Error(`YouTube returned status ${pageRes.status}`);
+  const segments =
+    transcriptData?.transcript?.content?.body?.initial_segments || [];
+
+  if (!segments.length) {
+    throw new Error("No transcript segments found for this video");
   }
 
-  const html = pageRes.body;
-
-  // Extract the caption tracks JSON from the page
-  const captionMatch = html.match(/"captions":\s*(\{.*?"captionTracks":\s*\[.*?\]\s*.*?\})/s);
-  
-  if (!captionMatch) {
-    // Try alternate pattern
-    const altMatch = html.match(/"captionTracks":\[(\{.*?\})\]/s);
-    if (!altMatch) {
-      throw new Error("No captions available for this video");
-    }
-  }
-
-  // Extract baseUrl from captionTracks
-  const trackMatch = html.match(/"baseUrl":"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/);
-  if (!trackMatch) {
-    throw new Error("Could not extract caption track URL");
-  }
-
-  let captionUrl = trackMatch[1].replace(/\\u0026/g, "&").replace(/\\/g, "");
-
-  // Prefer English captions
-  const allTracks = [...html.matchAll(/"baseUrl":"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/g)];
-  for (const match of allTracks) {
-    const url = match[1].replace(/\\u0026/g, "&").replace(/\\/g, "");
-    if (url.includes("lang=en") || url.includes("lang=en-")) {
-      captionUrl = url;
-      break;
-    }
-  }
-
-  // Step 2: Fetch the transcript XML
-  const transcriptRes = await fetchWithHeaders(captionUrl);
-  if (transcriptRes.status !== 200) {
-    throw new Error("Failed to fetch transcript XML");
-  }
-
-  const xml = transcriptRes.body;
-
-  // Parse transcript text from XML
-  const textMatches = [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)];
-  if (textMatches.length === 0) {
-    throw new Error("Transcript XML is empty or malformed");
-  }
-
-  const transcript = textMatches
-    .map((m) =>
-      m[1]
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/<[^>]+>/g, "")
-        .trim()
-    )
+  const text = segments
+    .map((seg) => seg?.snippet?.text || "")
     .filter(Boolean)
-    .join(" ");
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  return transcript;
+  if (!text) {
+    throw new Error("Transcript is empty");
+  }
+
+  return text;
 }
 
-// Summarize endpoint — API key stays server-side
+// Summarize endpoint
 app.post("/api/summarize", async (req, res) => {
   const { url, language } = req.body;
 
@@ -152,38 +85,32 @@ app.post("/api/summarize", async (req, res) => {
   // Step 1: Extract video ID
   const videoId = extractVideoId(url);
   if (!videoId) {
-    return res
-      .status(400)
-      .json({
-        error:
-          "Could not extract video ID from URL. Please use a valid YouTube URL.",
-      });
+    return res.status(400).json({
+      error: "Could not extract video ID from URL. Please use a valid YouTube URL.",
+    });
   }
 
-  // Step 2: Fetch YouTube transcript
+  // Step 2: Fetch transcript via YouTube InnerTube API
   let transcriptText = "";
   try {
     console.log(`Fetching transcript for video: ${videoId}`);
-    transcriptText = await fetchTranscriptFromYouTube(videoId);
+    transcriptText = await fetchTranscript(videoId);
 
-    // Trim transcript to ~12000 words to stay within context limits
+    // Trim to ~12000 words to stay within context limits
     const words = transcriptText.split(" ");
     if (words.length > 12000) {
       transcriptText = words.slice(0, 12000).join(" ") + "...";
     }
-
-    console.log(
-      `Transcript fetched: ${transcriptText.split(" ").length} words`
-    );
+    console.log(`Transcript fetched: ${transcriptText.split(" ").length} words`);
   } catch (transcriptErr) {
     console.error("Transcript error:", transcriptErr.message);
     return res.status(422).json({
       error:
-        "Could not fetch transcript. This video may have disabled captions, be private, age-restricted, or not have English captions. Please try another video.",
+        "Could not fetch transcript. This video may have disabled captions, be private, age-restricted, or not have English subtitles. Please try another video.",
     });
   }
 
-  // Step 3: Summarize with Groq (free LLaMA 3 model)
+  // Step 3: Summarize with Groq (Llama 3)
   try {
     const groq = new Groq({ apiKey });
 
@@ -215,20 +142,15 @@ Respond entirely in ${language}. Use proper Markdown formatting.`;
     console.error("Groq API error:", err);
     if (err.status === 401) {
       return res.status(401).json({
-        error:
-          "Invalid Groq API key. Get a free key at https://console.groq.com",
+        error: "Invalid Groq API key. Get a free key at https://console.groq.com",
       });
     }
     if (err.status === 429) {
-      return res
-        .status(429)
-        .json({
-          error: "Rate limit reached. Please wait a moment and try again.",
-        });
+      return res.status(429).json({
+        error: "Rate limit reached. Please wait a moment and try again.",
+      });
     }
-    res
-      .status(500)
-      .json({ error: err.message || "An unexpected error occurred." });
+    res.status(500).json({ error: err.message || "An unexpected error occurred." });
   }
 });
 
