@@ -1,5 +1,6 @@
 import express from "express";
 import Groq from "groq-sdk";
+import { YoutubeTranscript } from "youtube-transcript";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import path from "path";
@@ -10,7 +11,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json());
 
 // Serve static build files in production
 app.use(express.static(path.join(__dirname, "dist")));
@@ -33,107 +34,6 @@ function extractVideoId(url) {
   return null;
 }
 
-// Fetch YouTube page HTML with browser-like headers
-async function fetchYouTubePage(videoId) {
-  const { default: fetch } = await import("node-fetch");
-  const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Cache-Control": "no-cache",
-      Pragma: "no-cache",
-    },
-  });
-  if (!response.ok) throw new Error(`YouTube page returned ${response.status}`);
-  return response.text();
-}
-
-// Extract caption URL from page HTML
-function extractCaptionUrl(html) {
-  // Look for captionTracks in the page JSON data
-  const splitHtml = html.split('"captionTracks":');
-  if (splitHtml.length < 2) {
-    throw new Error("No caption tracks found — this video may not have captions");
-  }
-
-  const captionData = splitHtml[1].split(',"audioTracks"')[0];
-  
-  // Parse base URLs from caption tracks
-  const baseUrlMatches = [...captionData.matchAll(/"baseUrl":"([^"]+)"/g)];
-  if (!baseUrlMatches.length) {
-    throw new Error("Could not extract caption URL");
-  }
-
-  // Prefer English captions
-  let captionUrl = null;
-  
-  // Try to find English caption
-  const nameMatches = [...captionData.matchAll(/"vssId":"([^"]+)"/g)];
-  const allUrls = baseUrlMatches.map((m, i) => ({
-    url: m[1].replace(/\\u0026/g, "&"),
-    vssId: nameMatches[i]?.capture?.[1] || "",
-  }));
-
-  // Try asr (auto-generated) english first, then any english
-  for (const track of allUrls) {
-    if (track.url.includes("lang=en")) {
-      captionUrl = track.url;
-      break;
-    }
-  }
-
-  // Fallback to first available
-  if (!captionUrl) {
-    captionUrl = baseUrlMatches[0][1].replace(/\\u0026/g, "&");
-  }
-
-  return captionUrl;
-}
-
-// Fetch and parse transcript XML
-async function fetchTranscriptXml(captionUrl) {
-  const { default: fetch } = await import("node-fetch");
-  
-  // Add fmt=json3 for JSON format (easier to parse)
-  const jsonUrl = captionUrl + "&fmt=json3";
-  
-  const response = await fetch(jsonUrl, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    },
-  });
-
-  if (!response.ok) throw new Error(`Caption fetch returned ${response.status}`);
-  
-  const data = await response.json();
-  
-  // Parse JSON3 format
-  const events = data?.events || [];
-  const transcript = events
-    .filter((e) => e.segs)
-    .flatMap((e) => e.segs.map((s) => s.utf8 || ""))
-    .join(" ")
-    .replace(/\n/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return transcript;
-}
-
-// Main transcript fetcher
-async function getTranscript(videoId) {
-  const html = await fetchYouTubePage(videoId);
-  const captionUrl = extractCaptionUrl(html);
-  const transcript = await fetchTranscriptXml(captionUrl);
-  
-  if (!transcript || transcript.trim().length < 50) {
-    throw new Error("Transcript too short or empty");
-  }
-  
-  return transcript;
-}
-
 // Summarize endpoint
 app.post("/api/summarize", async (req, res) => {
   const { url, language } = req.body;
@@ -145,7 +45,7 @@ app.post("/api/summarize", async (req, res) => {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
     return res.status(500).json({
-      error: "Server is not configured. Add GROQ_API_KEY to .env file.",
+      error: "Server not configured. Add GROQ_API_KEY environment variable.",
     });
   }
 
@@ -157,22 +57,29 @@ app.post("/api/summarize", async (req, res) => {
     });
   }
 
-  // Step 2: Fetch transcript server-side
+  // Step 2: Fetch transcript
   let transcriptText = "";
   try {
     console.log(`Fetching transcript for: ${videoId}`);
-    transcriptText = await getTranscript(videoId);
+    let items;
+    try {
+      items = await YoutubeTranscript.fetchTranscript(videoId, { lang: "en" });
+    } catch {
+      // Fallback: try without language filter
+      items = await YoutubeTranscript.fetchTranscript(videoId);
+    }
+    transcriptText = items.map((t) => t.text).join(" ");
 
     // Trim to ~12000 words
     const words = transcriptText.split(" ");
     if (words.length > 12000) {
       transcriptText = words.slice(0, 12000).join(" ") + "...";
     }
-    console.log(`Got transcript: ${transcriptText.split(" ").length} words`);
-  } catch (transcriptErr) {
-    console.error("Transcript error:", transcriptErr.message);
+    console.log(`Transcript: ${transcriptText.split(" ").length} words`);
+  } catch (err) {
+    console.error("Transcript error:", err.message);
     return res.status(422).json({
-      error: "Could not fetch transcript. This video may have disabled captions, be private, or age-restricted. Please try a video that has English subtitles enabled.",
+      error: "Could not fetch transcript. This video may have disabled captions, be private, or age-restricted. Please try another video.",
     });
   }
 
@@ -210,13 +117,13 @@ Respond entirely in ${language}. Use proper Markdown formatting.`;
       return res.status(401).json({ error: "Invalid Groq API key." });
     }
     if (err.status === 429) {
-      return res.status(429).json({ error: "Rate limit reached. Please wait and try again." });
+      return res.status(429).json({ error: "Rate limit reached. Please wait a moment." });
     }
     res.status(500).json({ error: err.message || "An unexpected error occurred." });
   }
 });
 
-// Serve React app
+// Serve React app for all other routes
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "dist", "index.html"));
 });
