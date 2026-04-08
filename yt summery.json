@@ -1,0 +1,5 @@
+{
+    "name": "YouTube Video Summarizer",
+    "description": "Summarize any YouTube video using Google Gemini AI with URL context.",
+    "requestFramePermissions": []
+}
