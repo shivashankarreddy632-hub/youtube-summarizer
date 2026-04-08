@@ -1,7 +1,6 @@
 /**
  * YouTube Summarizer — Premium Redesign
  * Public-ready with backend API proxy (Groq AI — Free)
- * Transcript fetched client-side to bypass cloud IP restrictions
  */
 
 import { useState, useEffect } from "react";
@@ -21,7 +20,6 @@ import {
   Check,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
-import { YoutubeTranscript } from "youtube-transcript";
 import "./index.css";
 
 interface SummaryResult {
@@ -80,19 +78,6 @@ export default function App() {
     return pattern.test(u);
   };
 
-  // Helper: extract video ID from URL
-  const extractVideoId = (u: string): string | null => {
-    const patterns = [
-      /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/,
-      /^([a-zA-Z0-9_-]{11})$/,
-    ];
-    for (const p of patterns) {
-      const m = u.match(p);
-      if (m) return m[1];
-    }
-    return null;
-  };
-
   const summarizeVideo = async () => {
     if (!url.trim()) {
       setError("Please enter a YouTube URL");
@@ -103,37 +88,15 @@ export default function App() {
       return;
     }
 
-    const videoId = extractVideoId(url);
-    if (!videoId) {
-      setError("Could not extract video ID from URL.");
-      return;
-    }
-
     setLoading(true);
     setError(null);
     setResult(null);
 
     try {
-      // Step 1: Fetch transcript client-side (user's browser → YouTube, no cloud IP block)
-      let transcriptText = "";
-      try {
-        const items = await YoutubeTranscript.fetchTranscript(videoId, { lang: "en" });
-        transcriptText = items.map((t) => t.text).join(" ");
-      } catch {
-        // Fallback: try without language filter
-        const items = await YoutubeTranscript.fetchTranscript(videoId);
-        transcriptText = items.map((t) => t.text).join(" ");
-      }
-
-      if (!transcriptText.trim()) {
-        throw new Error("Could not fetch transcript. This video may have disabled captions or be private/age-restricted. Please try another video.");
-      }
-
-      // Step 2: Send transcript to our backend for Groq AI summarization
       const response = await fetch("/api/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: transcriptText, language: selectedLang }),
+        body: JSON.stringify({ url, language: selectedLang }),
       });
 
       const data = await response.json();
