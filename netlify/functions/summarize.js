@@ -58,12 +58,39 @@ exports.handler = async (event) => {
   let transcriptText = "";
   try {
     console.log(`Fetching transcript for: ${videoId}`);
+
+    // Custom fetch with real browser headers to avoid YouTube blocking cloud IPs
+    const customFetch = (url, init = {}) => fetch(url, {
+      ...init,
+      headers: {
+        ...init.headers,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Origin": "https://www.youtube.com",
+        "Referer": "https://www.youtube.com/",
+      }
+    });
+
     let items;
-    try {
-      items = await YoutubeTranscript.fetchTranscript(videoId, { lang: "en" });
-    } catch {
-      items = await YoutubeTranscript.fetchTranscript(videoId);
+    const attempts = [
+      () => YoutubeTranscript.fetchTranscript(videoId, { lang: "en", fetch: customFetch }),
+      () => YoutubeTranscript.fetchTranscript(videoId, { fetch: customFetch }),
+      () => YoutubeTranscript.fetchTranscript(videoId),
+    ];
+
+    let lastErr;
+    for (const attempt of attempts) {
+      try {
+        items = await attempt();
+        if (items && items.length > 0) break;
+      } catch (e) {
+        lastErr = e;
+      }
     }
+
+    if (!items || items.length === 0) throw lastErr || new Error("No transcript found");
+
     transcriptText = items.map((t) => t.text).join(" ");
 
     // Trim to ~12000 words
@@ -78,8 +105,7 @@ exports.handler = async (event) => {
       statusCode: 422,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        error:
-          "Could not fetch transcript. This video may have disabled captions, be private, or age-restricted.",
+        error: "Could not fetch transcript. Please make sure the video has captions enabled. Try a different video.",
       }),
     };
   }
