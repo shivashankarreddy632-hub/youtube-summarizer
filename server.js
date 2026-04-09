@@ -1,5 +1,5 @@
 import express from "express";
-import Groq from "groq-sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { YoutubeTranscript } from "youtube-transcript";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
@@ -18,7 +18,7 @@ app.use(express.static(path.join(__dirname, "dist")));
 
 // Health check
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", provider: "Groq (Free)" });
+  res.json({ status: "ok", provider: "Google Gemini (Free)" });
 });
 
 // Helper: extract YouTube video ID from any URL format
@@ -42,10 +42,10 @@ app.post("/api/summarize", async (req, res) => {
     return res.status(400).json({ error: "Missing url or language" });
   }
 
-  const apiKey = process.env.GROQ_API_KEY;
+  const apiKey = process.env.GOOGLE_API_KEY;
   if (!apiKey) {
     return res.status(500).json({
-      error: "Server not configured. Add GROQ_API_KEY environment variable.",
+      error: "Server not configured. Add GOOGLE_API_KEY environment variable.",
     });
   }
 
@@ -79,13 +79,15 @@ app.post("/api/summarize", async (req, res) => {
   } catch (err) {
     console.error("Transcript error:", err.message);
     return res.status(422).json({
-      error: "Could not fetch transcript. This video may have disabled captions, be private, or age-restricted. Please try another video.",
+      error:
+        "Could not fetch transcript. This video may have disabled captions, be private, or age-restricted. Please try another video.",
     });
   }
 
-  // Step 3: Summarize with Groq AI
+  // Step 3: Summarize with Google Gemini
   try {
-    const groq = new Groq({ apiKey });
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     const prompt = `You are an expert video summarizer. Below is the transcript of a YouTube video. Please provide a comprehensive summary entirely in ${language}.
 
@@ -100,24 +102,21 @@ Please structure your response in Markdown with the following sections:
 
 Respond entirely in ${language}. Use proper Markdown formatting.`;
 
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      max_tokens: 2048,
-    });
+    const result = await model.generateContent(prompt);
+    const text = result.response.text();
 
-    const text = completion.choices[0]?.message?.content;
     if (!text) throw new Error("Empty response from AI");
 
     res.json({ summary: text });
   } catch (err) {
-    console.error("Groq error:", err);
-    if (err.status === 401) {
-      return res.status(401).json({ error: "Invalid Groq API key." });
+    console.error("Gemini error:", err);
+    if (err.status === 401 || err.message?.includes("API_KEY_INVALID")) {
+      return res.status(401).json({ error: "Invalid Google API key." });
     }
-    if (err.status === 429) {
-      return res.status(429).json({ error: "Rate limit reached. Please wait a moment." });
+    if (err.status === 429 || err.message?.includes("RESOURCE_EXHAUSTED")) {
+      return res
+        .status(429)
+        .json({ error: "Rate limit reached. Please wait a moment." });
     }
     res.status(500).json({ error: err.message || "An unexpected error occurred." });
   }
@@ -130,6 +129,6 @@ app.get("*", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`\n🚀 YT Summarizer running at http://localhost:${PORT}`);
-  console.log(`   ✅ Using: Groq AI (Free) — llama-3.3-70b-versatile`);
+  console.log(`   ✅ Using: Google Gemini AI (Free) — gemini-1.5-flash`);
   console.log(`   📡 API:   http://localhost:${PORT}/api/summarize\n`);
 });
