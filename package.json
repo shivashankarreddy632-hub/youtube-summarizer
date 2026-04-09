@@ -4,16 +4,16 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -p \"[{name}]\" -n \"FRONTEND,BACKEND\" -c \"cyan,magenta\" \"vite --port=5173\" \"nodemon --watch server.js server.js\"",
+    "postinstall": "node scripts/patch-deps.cjs",
+    "dev": "concurrently -k -p \"[{name}]\" -n \"FRONTEND,BACKEND\" -c \"cyan,magenta\" \"vite --port=5173\" \"nodemon --watch server.cjs server.cjs\"",
     "dev:frontend": "vite --port=5173",
-    "dev:backend": "nodemon --watch server.js server.js",
+    "dev:backend": "nodemon --watch server.cjs server.cjs",
     "build": "vite build",
-    "start": "node server.js",
+    "start": "node server.cjs",
     "preview": "vite preview",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
     "clsx": "^2.1.1",

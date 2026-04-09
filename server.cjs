@@ -1,14 +1,12 @@
-import express from "express";
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
+"use strict";
+
+const express = require("express");
 const { YoutubeTranscript } = require("youtube-transcript");
-import dotenv from "dotenv";
-import { fileURLToPath } from "url";
-import path from "path";
+const dotenv = require("dotenv");
+const path = require("path");
 
 dotenv.config();
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 

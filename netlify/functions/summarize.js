@@ -1,26 +1,4 @@
-import express from "express";
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
 const { YoutubeTranscript } = require("youtube-transcript");
-import dotenv from "dotenv";
-import { fileURLToPath } from "url";
-import path from "path";
-
-dotenv.config();
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
-const PORT = process.env.PORT || 3001;
-
-app.use(express.json());
-
-// Serve static build files in production
-app.use(express.static(path.join(__dirname, "dist")));
-
-// Health check
-app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", provider: "Groq AI (Free)" });
-});
 
 // Helper: extract YouTube video ID from any URL format
 function extractVideoId(url) {
@@ -35,27 +13,45 @@ function extractVideoId(url) {
   return null;
 }
 
-// Summarize endpoint
-app.post("/api/summarize", async (req, res) => {
-  const { url, language } = req.body;
+exports.handler = async (event) => {
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, body: JSON.stringify({ error: "Method not allowed" }) };
+  }
+
+  let body;
+  try {
+    body = JSON.parse(event.body || "{}");
+  } catch {
+    return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON body" }) };
+  }
+
+  const { url, language } = body;
 
   if (!url || !language) {
-    return res.status(400).json({ error: "Missing url or language" });
+    return {
+      statusCode: 400,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error: "Missing url or language" }),
+    };
   }
 
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({
-      error: "Server not configured. Add GROQ_API_KEY environment variable.",
-    });
+    return {
+      statusCode: 500,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error: "Server not configured. GROQ_API_KEY missing." }),
+    };
   }
 
   // Step 1: Extract video ID
   const videoId = extractVideoId(url);
   if (!videoId) {
-    return res.status(400).json({
-      error: "Could not extract video ID. Please use a valid YouTube URL.",
-    });
+    return {
+      statusCode: 400,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error: "Could not extract video ID. Please use a valid YouTube URL." }),
+    };
   }
 
   // Step 2: Fetch transcript
@@ -66,7 +62,6 @@ app.post("/api/summarize", async (req, res) => {
     try {
       items = await YoutubeTranscript.fetchTranscript(videoId, { lang: "en" });
     } catch {
-      // Fallback: try without language filter
       items = await YoutubeTranscript.fetchTranscript(videoId);
     }
     transcriptText = items.map((t) => t.text).join(" ");
@@ -79,10 +74,14 @@ app.post("/api/summarize", async (req, res) => {
     console.log(`Transcript: ${transcriptText.split(" ").length} words`);
   } catch (err) {
     console.error("Transcript error:", err.message);
-    return res.status(422).json({
-      error:
-        "Could not fetch transcript. This video may have disabled captions, be private, or age-restricted. Please try another video.",
-    });
+    return {
+      statusCode: 422,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        error:
+          "Could not fetch transcript. This video may have disabled captions, be private, or age-restricted.",
+      }),
+    };
   }
 
   // Step 3: Summarize with Groq AI
@@ -118,10 +117,18 @@ Respond entirely in ${language}. Use proper Markdown formatting.`;
       const errData = await response.json();
       console.error("Groq API error:", errData);
       if (response.status === 401) {
-        return res.status(401).json({ error: "Invalid Groq API key." });
+        return {
+          statusCode: 401,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ error: "Invalid Groq API key." }),
+        };
       }
       if (response.status === 429) {
-        return res.status(429).json({ error: "Rate limit reached. Please wait a moment." });
+        return {
+          statusCode: 429,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ error: "Rate limit reached. Please wait a moment." }),
+        };
       }
       throw new Error(errData?.error?.message || "Groq API request failed");
     }
@@ -131,20 +138,17 @@ Respond entirely in ${language}. Use proper Markdown formatting.`;
 
     if (!text) throw new Error("Empty response from Groq AI");
 
-    res.json({ summary: text });
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ summary: text }),
+    };
   } catch (err) {
     console.error("Groq error:", err);
-    res.status(500).json({ error: err.message || "An unexpected error occurred." });
+    return {
+      statusCode: 500,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error: err.message || "An unexpected error occurred." }),
+    };
   }
-});
-
-// Serve React app for all other routes
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "dist", "index.html"));
-});
-
-app.listen(PORT, () => {
-  console.log(`\n🚀 YT Summarizer running at http://localhost:${PORT}`);
-  console.log(`   ✅ Using: Groq AI (Free) — llama-3.3-70b-versatile`);
-  console.log(`   📡 API:   http://localhost:${PORT}/api/summarize\n`);
-});
+};
