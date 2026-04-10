@@ -20,17 +20,10 @@ FROM node:20-alpine AS runtime
 
 WORKDIR /app
 
-# Install system deps needed by yt-dlp standalone binary
-# (wget to download it, ca-certificates for HTTPS, python3 is NOT needed —
-#  the yt-dlp_linux binary is fully self-contained)
-RUN apk add --no-cache wget ca-certificates
-
-# Download the official yt-dlp standalone Linux binary (x86_64)
-# This binary bundles its own Python — no system Python required.
-# yt-dlp is the most reliable way to fetch YouTube transcripts on cloud IPs.
-RUN wget -q -O /usr/local/bin/yt-dlp \
-      https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
-    && chmod +x /usr/local/bin/yt-dlp \
+# Install Python3 + pip so we can install yt-dlp via pip
+# (The yt-dlp_linux binary doesn't work on Alpine/musl — pip version does)
+RUN apk add --no-cache python3 py3-pip \
+    && pip install --quiet --break-system-packages yt-dlp \
     && yt-dlp --version
 
 # Copy package files and install production deps only
@@ -51,7 +44,7 @@ ENV NODE_ENV=production
 
 EXPOSE 7860
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
   CMD wget -qO- http://localhost:7860/api/health || exit 1
 
 CMD ["node", "server.cjs"]
