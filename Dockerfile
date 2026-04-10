@@ -1,5 +1,5 @@
 # ── Stage 1: Build the React frontend ──────────────────────────────────────────
-FROM node:20-alpine AS builder
+FROM node:20-slim AS builder
 
 WORKDIR /app
 
@@ -16,17 +16,22 @@ COPY src/ ./src/
 RUN npm run build
 
 # ── Stage 2: Production runtime ────────────────────────────────────────────────
-FROM node:20-alpine AS runtime
+# Using node:20-slim (Debian/glibc) — required for yt-dlp impersonate mode
+FROM node:20-slim AS runtime
 
 WORKDIR /app
 
-# Install Python3 + pip for yt-dlp (fallback transcript method)
-RUN apk add --no-cache python3 py3-pip \
-    && pip install --quiet --break-system-packages yt-dlp \
-    && yt-dlp --version
+# Install Python3 + pip + curl-impersonate dependencies for yt-dlp
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      python3 python3-pip curl wget ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy package files and install ALL dependencies
-# (youtubei.js is an ESM dep loaded via dynamic import at runtime)
+# Install yt-dlp via pip (works on Debian glibc without issues)
+RUN pip install --quiet --break-system-packages yt-dlp && \
+    yt-dlp --version
+
+# Copy package files and install ALL production deps
 COPY package*.json ./
 COPY scripts/ ./scripts/
 
@@ -45,6 +50,6 @@ ENV NODE_ENV=production
 EXPOSE 7860
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-  CMD wget -qO- http://localhost:7860/api/health || exit 1
+  CMD curl -sf http://localhost:7860/api/health || exit 1
 
 CMD ["node", "server.cjs"]

@@ -39,48 +39,54 @@ function extractVideoId(url) {
 // Uses YouTube's own internal API — exactly what the YouTube website/app uses.
 // YouTube cannot block this without breaking their own service.
 // It handles authentication challenges, visitor data, and client emulation.
-let _innertubeInstance = null;
-async function getInnertube() {
-  if (!_innertubeInstance) {
-    const { Innertube } = await import("youtubei.js");
-    _innertubeInstance = await Innertube.create({
-      retrieve_player: false,
-      generate_session_locally: true,
-    });
-  }
-  return _innertubeInstance;
-}
+// Try multiple YouTube client types — ANDROID/TV are less restricted on cloud IPs
+const INNERTUBE_CLIENTS = ["ANDROID", "TV_EMBEDDED", "WEB"];
 
 async function fetchTranscriptInnertube(videoId) {
-  const yt   = await getInnertube();
-  const info = await yt.getInfo(videoId);
+  const { Innertube, UniversalCache } = await import("youtubei.js");
 
-  // getTranscript may fail if no transcript exists; let it throw
-  const transcriptData = await info.getTranscript();
+  let lastErr;
+  for (const clientType of INNERTUBE_CLIENTS) {
+    try {
+      console.log(`[innertube] Trying client: ${clientType}`);
+      const yt = await Innertube.create({
+        retrieve_player: false,
+        generate_session_locally: true,
+        client_type: clientType,
+      });
 
-  // youtubei.js v13+ structure
-  const segments =
-    transcriptData?.transcript?.content?.body?.initial_segments ??
-    transcriptData?.transcript?.content?.body?.items;
+      const info           = await yt.getInfo(videoId);
+      const transcriptData = await info.getTranscript();
 
-  if (!segments || segments.length === 0) {
-    throw new Error("Innertube: transcript segments empty");
+      const segments =
+        transcriptData?.transcript?.content?.body?.initial_segments ??
+        transcriptData?.transcript?.content?.body?.items ??
+        [];
+
+      if (!segments || segments.length === 0) {
+        throw new Error(`${clientType}: empty segments`);
+      }
+
+      const text = segments
+        .map(seg =>
+          seg?.snippet?.text ??
+          seg?.transcript_segment_renderer?.snippet?.text ??
+          ""
+        )
+        .filter(Boolean)
+        .join(" ")
+        .replace(/[\n\r]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (text.length < 50) throw new Error(`${clientType}: text too short`);
+      return text;
+    } catch (e) {
+      console.warn(`[innertube] ${e.message}`);
+      lastErr = e;
+    }
   }
-
-  return segments
-    .map(seg => {
-      // Depending on version, text lives in different places
-      return (
-        seg?.snippet?.text ??
-        seg?.transcript_segment_renderer?.snippet?.text ??
-        ""
-      );
-    })
-    .filter(Boolean)
-    .join(" ")
-    .replace(/[\n\r]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  throw lastErr || new Error("Innertube: all clients failed");
 }
 
 // ─── Method 2: yt-dlp with pip-installed version + cookies workaround ────────
@@ -89,26 +95,26 @@ async function fetchTranscriptYtDlp(videoId) {
   const ytUrl  = `https://www.youtube.com/watch?v=${videoId}`;
   const outTpl = path.join(tmpDir, "%(id)s");
 
-  const args = [
+  const baseArgs = [
     "--skip-download",
-    "--write-auto-sub",
     "--sub-format", "json3",
     "--sub-langs",  "en,en-US,en-orig,en.*",
     "--no-playlist",
-    "--extractor-args", "youtube:skip=dash,hls",
-    // Impersonate a real browser to bypass bot detection
-    "--impersonate", "chrome",
+    "--user-agent",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "-o", outTpl,
     ytUrl,
   ];
 
-  try {
-    await execFileAsync("yt-dlp", args, { timeout: 40_000 });
-  } catch {
-    // Try manual subs if auto-sub fails
-    args[1] = "--write-subs";
-    await execFileAsync("yt-dlp", args, { timeout: 40_000 });
+  let downloaded = false;
+  for (const subFlag of ["--write-auto-sub", "--write-subs"]) {
+    try {
+      await execFileAsync("yt-dlp", [subFlag, ...baseArgs], { timeout: 40_000 });
+      downloaded = true;
+      break;
+    } catch {}
   }
+  if (!downloaded) throw new Error("yt-dlp: subtitle download failed");
 
   const files  = fs.readdirSync(tmpDir);
   const json3  = files.find(f => f.endsWith(".json3"));
@@ -169,8 +175,6 @@ async function fetchTranscript(videoId) {
     return text;
   } catch (e) {
     console.warn(`[transcript] InnerTube failed: ${e.message}`);
-    // Reset cached instance so next call creates a fresh session
-    _innertubeInstance = null;
   }
 
   // 2) yt-dlp — browser impersonation mode
