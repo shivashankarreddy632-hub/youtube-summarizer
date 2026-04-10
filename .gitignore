@@ -4,5 +4,11 @@ dist/
 coverage/
 .DS_Store
 *.log
-.env*
+
+# Environment files — never commit real secrets!
+.env
+.env.local
+.env.production
+
+# Keep the example file
 !.env.example
