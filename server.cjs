@@ -1,10 +1,10 @@
 "use strict";
 
 const express = require("express");
-const dotenv   = require("dotenv");
-const path     = require("path");
-const fs       = require("fs");
-const os       = require("os");
+const dotenv  = require("dotenv");
+const path    = require("path");
+const fs      = require("fs");
+const os      = require("os");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 
@@ -35,69 +35,103 @@ function extractVideoId(url) {
   return null;
 }
 
-// ─── Method 1: yt-dlp binary ─────────────────────────────────────────────────
-// yt-dlp properly emulates a real YouTube client. It handles cloud-IP blocking
-// that simple HTTP libraries cannot. Installed in Dockerfile.
+// ─── Method 1: youtubei.js (InnerTube API) ───────────────────────────────────
+// Uses YouTube's own internal API — exactly what the YouTube website/app uses.
+// YouTube cannot block this without breaking their own service.
+// It handles authentication challenges, visitor data, and client emulation.
+let _innertubeInstance = null;
+async function getInnertube() {
+  if (!_innertubeInstance) {
+    const { Innertube } = await import("youtubei.js");
+    _innertubeInstance = await Innertube.create({
+      retrieve_player: false,
+      generate_session_locally: true,
+    });
+  }
+  return _innertubeInstance;
+}
+
+async function fetchTranscriptInnertube(videoId) {
+  const yt   = await getInnertube();
+  const info = await yt.getInfo(videoId);
+
+  // getTranscript may fail if no transcript exists; let it throw
+  const transcriptData = await info.getTranscript();
+
+  // youtubei.js v13+ structure
+  const segments =
+    transcriptData?.transcript?.content?.body?.initial_segments ??
+    transcriptData?.transcript?.content?.body?.items;
+
+  if (!segments || segments.length === 0) {
+    throw new Error("Innertube: transcript segments empty");
+  }
+
+  return segments
+    .map(seg => {
+      // Depending on version, text lives in different places
+      return (
+        seg?.snippet?.text ??
+        seg?.transcript_segment_renderer?.snippet?.text ??
+        ""
+      );
+    })
+    .filter(Boolean)
+    .join(" ")
+    .replace(/[\n\r]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ─── Method 2: yt-dlp with pip-installed version + cookies workaround ────────
 async function fetchTranscriptYtDlp(videoId) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ytdlp-"));
   const ytUrl  = `https://www.youtube.com/watch?v=${videoId}`;
   const outTpl = path.join(tmpDir, "%(id)s");
 
-  const langGroups = [
-    ["en", "en-US", "en-GB", "en-orig"],
-    ["en.*"],           // any English variant
-    [".*"],             // absolutely any language
+  const args = [
+    "--skip-download",
+    "--write-auto-sub",
+    "--sub-format", "json3",
+    "--sub-langs",  "en,en-US,en-orig,en.*",
+    "--no-playlist",
+    "--extractor-args", "youtube:skip=dash,hls",
+    // Impersonate a real browser to bypass bot detection
+    "--impersonate", "chrome",
+    "-o", outTpl,
+    ytUrl,
   ];
 
-  let lastErr;
-  for (const langs of langGroups) {
-    for (const subFlag of ["--write-auto-sub", "--write-subs"]) {
-      try {
-        await execFileAsync(
-          "yt-dlp",
-          [
-            "--skip-download",
-            subFlag,
-            "--sub-format", "json3",
-            "--sub-langs",  langs.join(","),
-            "--no-playlist",
-            "--quiet",
-            "-o", outTpl,
-            ytUrl,
-          ],
-          { timeout: 35_000 }
-        );
-
-        const files   = fs.readdirSync(tmpDir);
-        const json3   = files.find(f => f.endsWith(".json3"));
-        if (!json3) continue;
-
-        const raw     = fs.readFileSync(path.join(tmpDir, json3), "utf8");
-        const data    = JSON.parse(raw);
-        const text    = (data.events || [])
-          .filter(e => e.segs)
-          .map(e => e.segs.map(s => s.utf8 || "").join(""))
-          .join(" ")
-          .replace(/[\n\r]+/g, " ")
-          .replace(/\s+/g, " ")
-          .trim();
-
-        if (text.length > 50) {
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-          return text;
-        }
-      } catch (e) {
-        lastErr = e;
-      }
-    }
+  try {
+    await execFileAsync("yt-dlp", args, { timeout: 40_000 });
+  } catch {
+    // Try manual subs if auto-sub fails
+    args[1] = "--write-subs";
+    await execFileAsync("yt-dlp", args, { timeout: 40_000 });
   }
 
+  const files  = fs.readdirSync(tmpDir);
+  const json3  = files.find(f => f.endsWith(".json3"));
+  if (!json3) throw new Error("yt-dlp: no subtitle file generated");
+
+  const raw  = fs.readFileSync(path.join(tmpDir, json3), "utf8");
+  const data = JSON.parse(raw);
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-  throw lastErr || new Error("yt-dlp: no subtitles found");
+
+  const text = (data.events || [])
+    .filter(e => e.segs)
+    .map(e => e.segs.map(s => s.utf8 || "").join(""))
+    .join(" ")
+    .replace(/[\n\r]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (text.length < 50) throw new Error("yt-dlp: transcript text too short");
+  return text;
 }
 
-// ─── Method 2: youtube-transcript (legacy fallback) ──────────────────────────
-// May work for some videos even on cloud IPs; kept as a last resort.
+// ─── Method 3: youtube-transcript library (last resort) ──────────────────────
 async function fetchTranscriptLegacy(videoId) {
   const { YoutubeTranscript } = require("youtube-transcript");
   const browserHeaders = {
@@ -105,117 +139,115 @@ async function fetchTranscriptLegacy(videoId) {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    Origin:  "https://www.youtube.com",
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    Origin: "https://www.youtube.com",
     Referer: "https://www.youtube.com/",
   };
-
   const customFetch = (u, init = {}) =>
     fetch(u, { ...init, headers: { ...init.headers, ...browserHeaders } });
 
-  const attempts = [
+  for (const fn of [
     () => YoutubeTranscript.fetchTranscript(videoId, { lang: "en", fetch: customFetch }),
     () => YoutubeTranscript.fetchTranscript(videoId, { fetch: customFetch }),
     () => YoutubeTranscript.fetchTranscript(videoId),
-  ];
-
-  let lastErr;
-  for (const attempt of attempts) {
+  ]) {
     try {
-      const items = await attempt();
-      if (items && items.length > 0) {
-        return items.map(t => t.text).join(" ");
-      }
-    } catch (e) {
-      lastErr = e;
-    }
+      const items = await fn();
+      if (items && items.length > 0) return items.map(t => t.text).join(" ");
+    } catch {}
   }
-  throw lastErr || new Error("youtube-transcript: no items returned");
+  throw new Error("youtube-transcript: no items returned");
 }
 
-// ─── Master transcript fetcher: tries all methods in order ───────────────────
+// ─── Master transcript fetcher ────────────────────────────────────────────────
 async function fetchTranscript(videoId) {
-  // 1. yt-dlp (most reliable on cloud IPs)
+  // 1) InnerTube — uses YouTube's own internal API, hardest to block
   try {
-    console.log(`[transcript] Trying yt-dlp…`);
+    console.log("[transcript] Trying InnerTube (youtubei.js)…");
+    const text = await fetchTranscriptInnertube(videoId);
+    console.log(`[transcript] InnerTube OK  — ${text.split(" ").length} words`);
+    return text;
+  } catch (e) {
+    console.warn(`[transcript] InnerTube failed: ${e.message}`);
+    // Reset cached instance so next call creates a fresh session
+    _innertubeInstance = null;
+  }
+
+  // 2) yt-dlp — browser impersonation mode
+  try {
+    console.log("[transcript] Trying yt-dlp…");
     const text = await fetchTranscriptYtDlp(videoId);
-    console.log(`[transcript] yt-dlp succeeded (${text.split(" ").length} words)`);
+    console.log(`[transcript] yt-dlp OK     — ${text.split(" ").length} words`);
     return text;
   } catch (e) {
     console.warn(`[transcript] yt-dlp failed: ${e.message}`);
   }
 
-  // 2. youtube-transcript library (fallback)
+  // 3) youtube-transcript library (legacy)
   try {
-    console.log(`[transcript] Trying youtube-transcript library…`);
+    console.log("[transcript] Trying youtube-transcript (legacy)…");
     const text = await fetchTranscriptLegacy(videoId);
-    console.log(`[transcript] youtube-transcript succeeded (${text.split(" ").length} words)`);
+    console.log(`[transcript] Legacy OK     — ${text.split(" ").length} words`);
     return text;
   } catch (e) {
-    console.warn(`[transcript] youtube-transcript failed: ${e.message}`);
+    console.warn(`[transcript] Legacy failed: ${e.message}`);
   }
 
-  throw new Error("All transcript methods failed");
+  throw new Error("All transcript methods exhausted");
 }
 
 // ─── /api/summarize ───────────────────────────────────────────────────────────
 app.post("/api/summarize", async (req, res) => {
   const { url, language } = req.body;
-
   if (!url || !language)
     return res.status(400).json({ error: "Missing url or language" });
 
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey)
     return res.status(500).json({
-      error: "Server not configured. Add GROQ_API_KEY environment variable.",
+      error: "Server not configured — GROQ_API_KEY missing.",
     });
 
-  // Step 1 – Extract video ID
   const videoId = extractVideoId(url);
   if (!videoId)
     return res.status(400).json({
       error: "Could not extract video ID. Please use a valid YouTube URL.",
     });
 
-  // Step 2 – Fetch transcript
+  // Step 2 — Fetch transcript
   let transcriptText;
   try {
-    console.log(`\n▶  Fetching transcript for: ${videoId}`);
+    console.log(`\n▶  videoId=${videoId}`);
     transcriptText = await fetchTranscript(videoId);
-
-    // Trim to ~12 000 words so we don't exceed Groq context
     const words = transcriptText.split(" ");
-    if (words.length > 12000) {
+    if (words.length > 12000)
       transcriptText = words.slice(0, 12000).join(" ") + "…";
-    }
   } catch (err) {
     console.error("Transcript error:", err.message);
     return res.status(422).json({
       error:
-        "Could not fetch transcript for this video. " +
-        "Make sure it has captions enabled (auto-generated or manual). " +
-        "If the video is very new, captions may not be ready yet — try again in a few minutes.",
+        "Could not get transcript for this video. " +
+        "Make sure it has captions enabled. " +
+        "If it's a brand-new video, captions may not be ready yet.",
     });
   }
 
-  // Step 3 – Summarize with Groq AI
+  // Step 3 — Summarize with Groq AI
   try {
-    const prompt = `You are an expert video summarizer. Below is the transcript of a YouTube video. Provide a comprehensive summary entirely in ${language}.
+    const prompt = `You are an expert video summarizer. Summarise the following YouTube transcript entirely in ${language}.
 
 TRANSCRIPT:
 ${transcriptText}
 
-Structure your response in Markdown:
+Respond in Markdown with:
 1. ## Title — a concise H2 heading
-2. ## Overview — 2–3 paragraph high-level summary
-3. ## Key Takeaways — bulleted list of 5–8 key points
-4. ## Tone & Sentiment — brief note on the video's overall tone
+2. ## Overview — 2–3 paragraph summary
+3. ## Key Takeaways — 5–8 bullet points
+4. ## Tone & Sentiment — brief note on the tone
 
-Respond entirely in ${language}. Use proper Markdown formatting.`;
+Use proper Markdown. Respond entirely in ${language}.`;
 
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -229,34 +261,33 @@ Respond entirely in ${language}. Use proper Markdown formatting.`;
       }),
     });
 
-    if (!response.ok) {
-      const errData = await response.json();
-      console.error("Groq API error:", errData);
-      if (response.status === 401)
+    if (!groqRes.ok) {
+      const e = await groqRes.json();
+      if (groqRes.status === 401)
         return res.status(401).json({ error: "Invalid Groq API key." });
-      if (response.status === 429)
-        return res.status(429).json({ error: "Rate limit reached. Please wait a moment." });
-      throw new Error(errData?.error?.message || "Groq API request failed");
+      if (groqRes.status === 429)
+        return res.status(429).json({ error: "Rate limit reached. Please wait." });
+      throw new Error(e?.error?.message || "Groq API request failed");
     }
 
-    const data = await response.json();
+    const data = await groqRes.json();
     const text = data.choices?.[0]?.message?.content;
     if (!text) throw new Error("Empty response from Groq AI");
 
     res.json({ summary: text });
   } catch (err) {
     console.error("Groq error:", err);
-    res.status(500).json({ error: err.message || "An unexpected error occurred." });
+    res.status(500).json({ error: err.message || "Unexpected error." });
   }
 });
 
-// Serve React SPA for all other routes
+// SPA fallback
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "dist", "index.html"));
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 YT Summarizer running at http://localhost:${PORT}`);
+  console.log(`\n🚀 YT Summarizer at http://localhost:${PORT}`);
   console.log(`   ✅ AI:  Groq (llama-3.3-70b-versatile)`);
   console.log(`   📡 API: http://localhost:${PORT}/api/summarize\n`);
 });

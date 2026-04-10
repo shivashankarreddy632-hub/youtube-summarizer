@@ -20,13 +20,13 @@ FROM node:20-alpine AS runtime
 
 WORKDIR /app
 
-# Install Python3 + pip so we can install yt-dlp via pip
-# (The yt-dlp_linux binary doesn't work on Alpine/musl — pip version does)
+# Install Python3 + pip for yt-dlp (fallback transcript method)
 RUN apk add --no-cache python3 py3-pip \
     && pip install --quiet --break-system-packages yt-dlp \
     && yt-dlp --version
 
-# Copy package files and install production deps only
+# Copy package files and install ALL dependencies
+# (youtubei.js is an ESM dep loaded via dynamic import at runtime)
 COPY package*.json ./
 COPY scripts/ ./scripts/
 
